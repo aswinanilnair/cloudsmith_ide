@@ -1,0 +1,7 @@
+.env.gcp
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.DS_Store
+DELETE_ON_DEPLOY/

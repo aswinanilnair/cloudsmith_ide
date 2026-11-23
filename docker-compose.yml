@@ -1,0 +1,121 @@
+# CloudSmith, locally. Start it with:  scripts/local.sh up
+#
+#   Cloud Run API    -> api       dashboard at http://localhost:8000
+#   Cloud SQL        -> postgres
+#   Pub/Sub          -> pubsub    (the official emulator)
+#   Cloud Storage    -> gcs       (fake-gcs-server)
+#   worker VMs       -> agent-1 + proxy-1   workspaces open at http://ws-<id>.localhost:8080
+#                       agent-2 + proxy-2   workspaces open at http://ws-<id>.localhost:8081
+#                       Both use the local Docker engine; each manages only its own workspaces.
+
+name: cloudsmith
+
+x-secrets: &secrets
+  TOKEN_SECRET: dev-token-secret
+  INTERNAL_TOKEN: dev-internal-token
+
+x-pubsub: &pubsub
+  GCP_PROJECT: local-project
+  PUBSUB_EMULATOR_HOST: pubsub:8085
+
+x-agent-env: &agent-env
+  API_URL: http://api:8000
+  WORKSPACE_IMAGE: cloudsmith/workspace:latest
+  STORAGE_EMULATOR_HOST: http://gcs:4443
+  GCS_BUCKET: cloudsmith-workspaces
+  WORKER_CAPACITY: "3"
+
+x-agent: &agent
+  build: ./services/agent
+  restart: unless-stopped
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cloudsmith
+      POSTGRES_PASSWORD: cloudsmith
+      POSTGRES_DB: cloudsmith
+    volumes: [db:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloudsmith"]
+      interval: 2s
+      retries: 30
+
+  pubsub:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    command: gcloud beta emulators pubsub start --project=local-project --host-port=0.0.0.0:8085
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8085 || exit 1"]
+      interval: 3s
+      retries: 40
+
+  gcs:
+    image: fsouza/fake-gcs-server:1.52.2
+    command: ["-scheme", "http", "-port", "4443", "-external-url", "http://gcs:4443"]
+    volumes: [gcs:/storage]
+
+  api:
+    build: ./services/api
+    environment:
+      <<: [*secrets, *pubsub]
+      DATABASE_URL: postgresql://cloudsmith:cloudsmith@postgres:5432/cloudsmith
+      WORKER_TIMEOUT_SECONDS: "30"
+      IDLE_TIMEOUT_MINUTES: "${IDLE_TIMEOUT_MINUTES:-30}"  # scripts/test.sh e2e local --idle sets 1
+      PORT: "8000"
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      pubsub: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 3s
+      retries: 40
+
+  proxy-1:
+    build: ./services/proxy
+    container_name: cloudsmith-proxy-1  # agent-1 attaches this container to each of its workspace networks
+    environment:
+      <<: *secrets
+      WORKER_ID: worker-1
+    ports: ["8080:8080"]
+
+  proxy-2:
+    build: ./services/proxy
+    container_name: cloudsmith-proxy-2
+    environment:
+      <<: *secrets
+      WORKER_ID: worker-2
+    ports: ["8081:8080"]
+
+  agent-1:
+    <<: *agent
+    environment:
+      <<: [*secrets, *pubsub, *agent-env]
+      WORKER_ID: worker-1
+      WORKER_VM: agent-1 (local)
+      WORKSPACE_URL: http://ws-{id}.localhost:8080/
+      PROXY_CONTAINER: cloudsmith-proxy-1
+    depends_on:
+      api: { condition: service_healthy }
+      gcs: { condition: service_started }
+      proxy-1: { condition: service_started }
+
+  agent-2:
+    <<: *agent
+    environment:
+      <<: [*secrets, *pubsub, *agent-env]
+      WORKER_ID: worker-2
+      WORKER_VM: agent-2 (local)
+      WORKSPACE_URL: http://ws-{id}.localhost:8081/
+      PROXY_CONTAINER: cloudsmith-proxy-2
+    depends_on:
+      api: { condition: service_healthy }
+      gcs: { condition: service_started }
+      proxy-2: { condition: service_started }
+
+volumes:
+  db:
+  gcs:

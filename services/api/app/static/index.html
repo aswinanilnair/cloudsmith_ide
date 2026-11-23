@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CloudSmith</title>
+<style>
+  :root { --bg:#f7f7f8; --card:#fff; --fg:#1d1d1f; --muted:#6b6b76; --line:#e3e3e8; --accent:#2563eb; --ok:#15803d; --warn:#b45309; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111214; --card:#1b1c1f; --fg:#ececf1; --muted:#9a9aa5; --line:#2c2d31; --accent:#60a5fa; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; gap:12px; padding:14px 20px; border-bottom:1px solid var(--line); background:var(--card); }
+  header h1 { font-size:17px; margin:0; flex:1; }
+  main { max-width:900px; margin:0 auto; padding:20px 16px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:18px; }
+  #login { max-width:380px; margin:40px auto; }
+  h2 { font-size:14px; margin:0 0 12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  button, input { font:inherit; padding:6px 10px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  button { cursor:pointer; } button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  .stack { display:grid; gap:8px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .table-wrap { overflow-x:auto; margin-top:12px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); white-space:nowrap; vertical-align:top; }
+  th { font-weight:600; color:var(--muted); font-size:12px; }
+  td.actions { text-align:right; } td.actions button + button { margin-left:6px; }
+  .state { font-weight:600; font-size:12px; }
+  .RUNNING { color:var(--ok); } .PENDING, .STOPPING { color:var(--warn); }
+  .FAILED { color:var(--bad); } .STOPPED { color:var(--muted); }
+  .error { display:block; font-weight:400; color:var(--muted); white-space:normal; max-width:320px; }
+  .muted { color:var(--muted); } .err { color:var(--bad); }
+  .summary { margin:0; color:var(--muted); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:8px; vertical-align:1px; }
+  .dot.online { background:var(--ok); } .dot.late { background:var(--warn); } .dot.offline { background:var(--bad); }
+  .toggle { border:none; background:none; padding:0 6px 0 0; color:var(--muted); width:20px; }
+  tr.details td { background:var(--bg); padding:10px 12px; }
+  dl.kv { display:grid; grid-template-columns:max-content 1fr; gap:4px 16px; margin:0; font-size:13px; }
+  dl.kv dt { color:var(--muted); } dl.kv dd { margin:0; white-space:normal; word-break:break-all; }
+  code { font:12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CloudSmith</h1>
+  <span id="who" class="muted"></span>
+  <button id="logout" hidden>Sign out</button>
+</header>
+<main>
+  <section id="login" hidden>
+    <h2>Sign in</h2>
+    <form id="loginform" class="stack">
+      <input id="username" autocomplete="username" placeholder="Username" required>
+      <input id="password" type="password" autocomplete="current-password" placeholder="Password" required>
+      <div class="row">
+        <button class="primary">Sign in</button>
+        <button id="signup" type="button">Create account</button>
+      </div>
+    </form>
+    <p id="loginerr" class="err"></p>
+  </section>
+
+  <section id="workers" hidden>
+    <h2>Workers</h2>
+    <p id="workersummary" class="summary"></p>
+    <div class="table-wrap" id="workertable" hidden>
+      <table>
+        <thead><tr><th>Worker VM</th><th>IP address</th><th>Workspaces</th><th>Last heartbeat</th></tr></thead>
+        <tbody id="workerrows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="app" hidden>
+    <h2>Your workspaces</h2>
+    <form id="createform" class="row">
+      <input id="wsname" placeholder="Workspace name" maxlength="40" required>
+      <button class="primary">Create workspace</button>
+      <span id="msg" class="muted"></span>
+    </form>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Name</th><th>State</th><th>Created</th><th></th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <p id="empty" class="muted" hidden>No workspaces yet. Each workspace is VS Code in the browser with Python installed.</p>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let token = null, user = null;
+try { token = localStorage.getItem("cs_token"); } catch (e) {}
+
+// Calls the API with the session token; signs out on 401 and throws the API's error message.
+async function api(path, opts = {}) {
+  const headers = { "Content-Type": "application/json" };
+  if (token) headers.Authorization = "Bearer " + token;
+  const res = await fetch(path, { ...opts, headers });
+  const body = res.status === 204 ? null : await res.json().catch(() => null);
+  if (res.status === 401 && token) { logout(); }
+  if (!res.ok) throw new Error((body && body.detail) || res.statusText);
+  return body;
+}
+
+// Stores or clears the session token.
+function setToken(t) { token = t; try { t ? localStorage.setItem("cs_token", t) : localStorage.removeItem("cs_token"); } catch (e) {} }
+// Signs out.
+function logout() { setToken(null); user = null; render(); }
+
+// Shows the sign-in form or the dashboard, depending on whether a user is signed in.
+function render() {
+  $("login").hidden = !!token; $("app").hidden = !token; $("workers").hidden = !token; $("logout").hidden = !token;
+  $("who").textContent = user ? user.username : "";
+}
+
+// Signs in or signs up with the form's username and password.
+async function authenticate(path) {
+  $("loginerr").textContent = "";
+  try {
+    const body = JSON.stringify({ username: $("username").value, password: $("password").value });
+    const resp = await api(path, { method: "POST", body });
+    setToken(resp.token); user = resp.user; $("password").value = "";
+    render(); poll();
+  } catch (e) { $("loginerr").textContent = e.message; }
+}
+
+// Adds a table cell with the given text.
+function cell(tr, text, cls) { const td = document.createElement("td"); td.textContent = text ?? ""; if (cls) td.className = cls; tr.appendChild(td); return td; }
+const busy = new Set();  // workspaces with an action in flight; their buttons stay disabled across redraws
+// Creates an action button that stays disabled while its request runs.
+function button(label, fn, primary, wsId) {
+  const b = document.createElement("button"); b.textContent = label; if (primary) b.className = "primary";
+  b.disabled = busy.has(wsId);
+  b.onclick = async () => {
+    busy.add(wsId); drawWorkspaces(); $("msg").textContent = "";
+    try { await fn(); } catch (e) { $("msg").textContent = e.message; }
+    finally { busy.delete(wsId); drawWorkspaces(); poll(); }
+  };
+  return b;
+}
+// Formats a time as "just now", "5m ago", "3h ago" or a date.
+function ago(ts) { const s = Math.round((Date.now() - new Date(ts)) / 1000); return s < 60 ? "just now" : s < 3600 ? Math.round(s / 60) + "m ago" : s < 86400 ? Math.round(s / 3600) + "h ago" : new Date(ts).toLocaleDateString(); }
+
+// Opens a workspace in a new tab, through its short-lived link.
+async function openWorkspace(id) {
+  // Open the tab first: browsers block window.open() after an await.
+  const tab = window.open("", "_blank");
+  try { const { url } = await api(`/api/workspaces/${id}/open`); tab.opener = null; tab.location = url; }
+  catch (e) { tab.close(); throw e; }
+}
+
+// Formats the time since a moment as "2h 5m", "4m 12s" or "35s".
+function duration(ts) {
+  const s = Math.max(0, Math.floor((Date.now() - new Date(ts)) / 1000));
+  const d = Math.floor(s / 86400), h = Math.floor(s / 3600) % 24, m = Math.floor(s / 60) % 60;
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
+}
+// Formats a number of seconds as "12s ago", "5m ago" or "3h ago".
+function seconds(s) { return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`; }
+
+const STATUS = { online: "Online", late: "Not responding", offline: "Offline" };
+let workerStatus = {};  // worker id -> online | late | offline
+let workersSeq = 0, workspacesSeq = 0;  // a reply older than the newest request is ignored
+// Fetches and draws the worker pool.
+async function refreshWorkers() {
+  const n = ++workersSeq;
+  const pool = await api("/api/workers");
+  if (n !== workersSeq) return;
+  workerStatus = Object.fromEntries(pool.workers.map((w) => [w.id, w.status]));
+  $("workersummary").textContent = pool.total
+    ? `${pool.online} of ${pool.total} worker${pool.total === 1 ? "" : "s"} online · ${pool.used} of ${pool.capacity} workspace slots in use`
+    : "No workers have checked in yet.";
+  $("workertable").hidden = !pool.total;
+  const tbody = $("workerrows"); tbody.innerHTML = "";
+  for (const w of pool.workers) {
+    const tr = document.createElement("tr");
+    const name = cell(tr, w.vm);
+    const dot = document.createElement("span"); dot.className = "dot " + w.status; dot.title = STATUS[w.status];
+    name.prepend(dot);
+    const sub = document.createElement("span"); sub.className = "error"; sub.textContent = `${STATUS[w.status]} · ${w.id}`; name.appendChild(sub);
+    cell(tr, w.address);
+    cell(tr, `${w.used} / ${w.capacity}`);
+    cell(tr, seconds(w.last_heartbeat_s), "muted");
+    tbody.appendChild(tr);
+  }
+}
+
+const expanded = new Set();  // workspaces whose details are open; kept across refreshes
+let lastWorkspaces = [];
+
+// Builds the expandable details row of a workspace (worker VM, ID, uptime).
+function details(ws) {
+  const tr = document.createElement("tr"); tr.className = "details";
+  const td = document.createElement("td"); td.colSpan = 4; tr.appendChild(td);
+  const dl = document.createElement("dl"); dl.className = "kv"; td.appendChild(dl);
+  const item = (label, value, code) => {
+    const dt = document.createElement("dt"); dt.textContent = label;
+    const dd = document.createElement("dd");
+    if (code) { const c = document.createElement("code"); c.textContent = value; dd.appendChild(c); } else dd.textContent = value;
+    dl.append(dt, dd);
+  };
+  item("Worker VM", ws.worker ? `${ws.worker_vm || ws.worker} (${ws.worker})` : "None: stopped, its files are in Cloud Storage");
+  item("Workspace ID", ws.id, true);
+  item("Uptime", ws.state !== "RUNNING" ? "Not running" : ws.started_at ? duration(ws.started_at) : "Unknown");
+  return tr;
+}
+
+// Refreshes the worker pool and the workspace list.
+async function refresh() {
+  if (!token) return;
+  await Promise.all([refreshWorkers().catch(() => {}), refreshWorkspaces()]);
+}
+
+// Fetches the user's workspaces and redraws them.
+async function refreshWorkspaces() {
+  const n = ++workspacesSeq;
+  const { workspaces } = await api("/api/workspaces");
+  if (n !== workspacesSeq) return;
+  lastWorkspaces = workspaces;
+  drawWorkspaces();
+}
+
+// Draws the workspace table with each workspace's actions.
+function drawWorkspaces() {
+  const workspaces = lastWorkspaces;
+  const tbody = $("rows"); tbody.innerHTML = "";
+  $("empty").hidden = workspaces.length > 0;
+  for (const ws of workspaces) {
+    const tr = document.createElement("tr");
+    const open = expanded.has(ws.id);
+    const name = cell(tr, ws.name);
+    const toggle = document.createElement("button");
+    toggle.className = "toggle"; toggle.textContent = open ? "▾" : "▸";
+    toggle.title = open ? "Hide details" : "Show details"; toggle.setAttribute("aria-expanded", open);
+    toggle.onclick = () => { open ? expanded.delete(ws.id) : expanded.add(ws.id); drawWorkspaces(); };
+    name.prepend(toggle);
+    const state = cell(tr, ws.state, "state " + ws.state);
+    if (ws.worker) { const w = document.createElement("span"); w.className = "error"; w.textContent = "on " + ws.worker; state.appendChild(w); }
+    if (ws.worker && (ws.state === "RUNNING" || ws.state === "PENDING") && ["late", "offline"].includes(workerStatus[ws.worker])) {
+      const n = document.createElement("span"); n.className = "error err";
+      n.textContent = "Its worker is not responding; it will be restarted on another worker if this lasts";
+      state.appendChild(n);
+    }
+    if (ws.error) { const e = document.createElement("span"); e.className = "error"; e.textContent = ws.error; state.appendChild(e); }
+    cell(tr, ago(ws.created_at), "muted");
+    const actions = cell(tr, "", "actions");
+    if (ws.state === "RUNNING") {
+      actions.appendChild(button("Open", () => openWorkspace(ws.id), true, ws.id));
+      actions.appendChild(button("Stop", () => api(`/api/workspaces/${ws.id}/stop`, { method: "POST" }), false, ws.id));
+    }
+    if (ws.state === "STOPPED" || ws.state === "FAILED") {
+      actions.appendChild(button("Start", () => api(`/api/workspaces/${ws.id}/start`, { method: "POST" }), false, ws.id));
+    }
+    actions.appendChild(button("Delete", async () => {
+      if (confirm(`Delete "${ws.name}" and all of its files?`)) await api(`/api/workspaces/${ws.id}`, { method: "DELETE" });
+    }, false, ws.id));
+    tbody.appendChild(tr);
+    if (open) tbody.appendChild(details(ws));
+  }
+}
+
+$("loginform").onsubmit = (e) => { e.preventDefault(); authenticate("/api/login"); };
+$("signup").onclick = () => { if ($("loginform").reportValidity()) authenticate("/api/signup"); };
+$("logout").onclick = logout;
+$("createform").onsubmit = async (e) => {
+  e.preventDefault();
+  const submit = e.submitter; submit.disabled = true; $("msg").textContent = "";
+  try { await api("/api/workspaces", { method: "POST", body: JSON.stringify({ name: $("wsname").value }) }); $("wsname").value = ""; }
+  catch (err) { $("msg").textContent = err.message; }
+  finally { submit.disabled = false; poll(); }
+};
+
+// Loads the signed-in user, if any, and starts polling.
+async function boot() {
+  render();
+  if (!token) return;
+  user = await api("/api/me"); render();
+  poll();
+}
+
+// Poll the lists: every second while a workspace is changing state (so each step shows), every
+// 3 seconds otherwise. Browsers slow timers in background tabs, so refresh at once when the tab is
+// shown again. Each poll starts after the previous one ends.
+let pollTimer = null;
+async function poll() {
+  clearTimeout(pollTimer);
+  try { await refresh(); } catch (e) {}
+  const changing = lastWorkspaces.some((ws) => ws.state === "PENDING" || ws.state === "STOPPING");
+  clearTimeout(pollTimer);
+  if (token) pollTimer = setTimeout(poll, changing ? 1000 : 3000);
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") poll(); });
+window.addEventListener("focus", () => poll());
+boot().catch(() => render());
+</script>
+</body>
+</html>
